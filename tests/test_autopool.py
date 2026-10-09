@@ -86,6 +86,36 @@ def test_inactive_ancestor_is_skipped_but_higher_ones_still_paid(db, members, ba
     assert [c.level for c in comms(db, members[0], "autopool")] == [1, 2]
 
 
+def test_head_missed_while_blocked_still_counts_so_the_reward_completes(db, members):
+    set_plan(db, "autopool", [(200, 500, 0)])  # default width 5
+    top = members[0]
+    e0 = enter_autopool(db, top)
+    enter_autopool(db, members[1])
+    top.status = "blocked"
+    enter_autopool(db, members[2])  # head 2 is not paid
+    top.status = "active"
+    for m in members[3:6]:
+        enter_autopool(db, m)
+    r = reward(db, top, "autopool", 1, entry_id=e0.id)
+    assert (r.status, r.accrued_amount) == ("achieved", D("500"))
+    assert len(comms(db, top, "autopool")) == 4
+    assert net_sum(comms(db, top, "autopool")) == D("300")  # plan net 500 less the one 200 head it missed
+    assert_ledger_consistent(db)
+
+
+def test_last_head_missed_while_blocked_still_completes_the_reward(db, members):
+    set_plan(db, "autopool", [(200, 500, 0)])
+    top = members[0]
+    e0 = enter_autopool(db, top)
+    for m in members[1:5]:
+        enter_autopool(db, m)
+    top.status = "blocked"
+    enter_autopool(db, members[5])
+    r = reward(db, top, "autopool", 1, entry_id=e0.id)
+    assert (r.status, r.accrued_amount) == ("achieved", D("400")) and r.achieved_at is not None
+    assert_ledger_consistent(db)
+
+
 def test_new_entry_never_reuses_a_position_after_an_entry_was_deleted(db, members):
     set_setting(db, "autopool_width", 2)
     entries = [enter_autopool(db, m) for m in members[:3]]

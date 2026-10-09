@@ -20,8 +20,6 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         raise HTTPException(403, "This login is for administrators only")
     if body.portal == "user" and user.role != "user":
         raise HTTPException(403, "Administrators please use the Admin login")
-    if user.status == "pending":
-        raise HTTPException(403, "Your registration is waiting for admin approval")
     if user.status in ("blocked", "rejected"):
         raise HTTPException(403, f"Your account is {user.status}. Please contact support")
     return {"token": create_token(user), "user": user_detail(db, user)}
@@ -36,7 +34,8 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 def signup(body: RegisterIn, db: Session = Depends(get_db)):
     u = register_member(db, body.model_dump(), None, payment="pending")
     db.commit()
-    return {"message": "Registration submitted. You can login once admin approves it.", "username": u.username}
+    return {"message": "Registration successful. You can login now and activate your package with a pin or "
+                       "your e-wallet.", "username": u.username, "status": u.status}
 
 
 @router.get("/public/packages")

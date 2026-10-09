@@ -77,7 +77,7 @@ class WalletTransaction(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     type: Mapped[str] = mapped_column(String(10))  # credit | debit
-    category: Mapped[str] = mapped_column(String(30))  # commission, fund_credit, fund_debit, fund_transfer, payout, payout_refund, registration
+    category: Mapped[str] = mapped_column(String(30))  # commission, fund_credit, fund_debit, fund_transfer, payout, payout_refund, registration, pin_purchase
     amount: Mapped[Decimal] = mapped_column(Money)
     description: Mapped[str] = mapped_column(String(255), default="")
     reference_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -173,6 +173,28 @@ class Payout(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship()
+
+
+class Pin(Base):
+    """Joining pin. A franchise buys pins in bulk (paying the package price less its franchise commission per pin),
+    may transfer them to other members, and the holder spends one pin to register and activate a member."""
+    __tablename__ = "pins"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("packages.id"))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)  # current holder
+    purchased_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"))  # franchise that bought it
+    price: Mapped[Decimal] = mapped_column(Money)  # package price at purchase
+    commission: Mapped[Decimal] = mapped_column(Money, default=0)  # franchise commission credited at purchase
+    status: Mapped[str] = mapped_column(String(10), default="unused")  # unused | used
+    used_for_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)  # member registered with it
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    package: Mapped[Package] = relationship()
+    owner: Mapped[User] = relationship(foreign_keys=[owner_id])
+    purchased_by: Mapped[User] = relationship(foreign_keys=[purchased_by_id])
+    used_for: Mapped["User | None"] = relationship(foreign_keys=[used_for_id])
 
 
 class Mail(Base):

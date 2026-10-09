@@ -84,12 +84,12 @@ def register(body: RegisterIn, me: User = Depends(get_current_user), db: Session
     if me.role == "admin":
         payment = "admin"
     else:
-        payment = "ewallet" if body.payment_method == "ewallet" else "pending"
+        payment = body.payment_method if body.payment_method in ("ewallet", "pin") else "pending"
         sponsor = resolve_root(db, me, body.sponsor_username)  # sponsor must be me or my downline
         data["sponsor_username"] = sponsor.username
     u = register_member(db, data, me, payment)
     db.commit()
-    msg = "Member registered and activated" if u.status == "active" else "Member registered. Waiting for admin approval"
+    msg = "Member registered and activated" if u.status == "active" else "Member registered. Activation is pending until the package is paid"
     return {"message": msg, "username": u.username, "status": u.status}
 
 

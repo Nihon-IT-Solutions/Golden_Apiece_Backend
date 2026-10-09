@@ -7,10 +7,11 @@ from sqlalchemy.orm import Session
 
 from ..auth import require_user
 from ..database import get_db
-from ..models import AutoPoolEntry, Commission, Payout, Reward, User, WalletTransaction
-from ..schemas import PayoutRequestIn, TransferIn
-from ..services import (add_txn, autopool_level_counts, check_txn_password, downline, get_setting, money, month_series,
-                        plan_levels, setting_int, user_brief, user_detail, wallet_balance, wallet_totals)
+from ..models import AutoPoolEntry, Commission, Package, Payout, Pin, Reward, User, WalletTransaction
+from ..schemas import ActivateIn, PayoutRequestIn, PinBuyIn, PinTransferIn, TransferIn
+from ..services import (activate_with_payment, add_txn, autopool_level_counts, buy_pins, check_txn_password, downline, get_setting, money,
+                        month_series, pin_out, plan_levels, setting_int, transfer_pins, user_brief, user_detail,
+                        wallet_balance, wallet_totals)
 
 router = APIRouter(prefix="/api/member", tags=["member"])
 
@@ -202,6 +203,42 @@ def transfer(body: TransferIn, me: User = Depends(require_user), db: Session = D
     add_txn(db, to.id, "credit", "fund_transfer", body.amount, f"{note} from {me.username}", me.id)
     db.commit()
     return {"message": f"Transferred {body.amount:.2f} to {to.username}"}
+
+
+@router.post("/activate")
+def activate(body: ActivateIn, me: User = Depends(require_user), db: Session = Depends(get_db)):
+    activate_with_payment(db, me, body.payment_method, body.pin_code, body.txn_password)
+    db.commit()
+    return {"message": "Your account is now active", "status": me.status}
+
+
+@router.get("/pins")
+def pins(me: User = Depends(require_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Pin).where(Pin.owner_id == me.id).order_by(Pin.status.desc(), Pin.id.desc())).all()
+    summary: dict[int, dict] = {}
+    for p in rows:
+        s = summary.setdefault(p.package_id, {"package_id": p.package_id, "package": p.package.name, "unused": 0,
+                                              "used": 0})
+        s[p.status] += 1
+    return {"is_franchise": me.is_franchise, "balance": wallet_balance(db, me.id),
+            "summary": list(summary.values()), "items": [pin_out(p) for p in rows]}
+
+
+@router.post("/pins/buy")
+def pins_buy(body: PinBuyIn, me: User = Depends(require_user), db: Session = Depends(get_db)):
+    check_txn_password(me, body.txn_password)
+    bought = buy_pins(db, me, db.get(Package, body.package_id), body.quantity)
+    db.commit()
+    return {"message": f"Bought {len(bought)} {bought[0].package.name} pins", "codes": [p.code for p in bought]}
+
+
+@router.post("/pins/transfer")
+def pins_transfer(body: PinTransferIn, me: User = Depends(require_user), db: Session = Depends(get_db)):
+    check_txn_password(me, body.txn_password)
+    to = db.scalar(select(User).where(func.upper(User.username) == body.to_username.strip().upper()))
+    moved = transfer_pins(db, me, to, db.get(Package, body.package_id), body.quantity)
+    db.commit()
+    return {"message": f"Transferred {len(moved)} pins to {to.username}"}
 
 
 @router.get("/payouts")

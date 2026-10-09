@@ -42,13 +42,14 @@ def test_double_approve_pays_once_and_second_call_is_refused(client, db, root, p
     assert_ledger_consistent(db)
 
 
-def test_rejected_member_pays_nothing_and_cannot_be_approved_later(client, db, root, pkg):
+def test_registrations_can_no_longer_be_rejected(client, db, root, pkg):
     set_plan(db, "level", [(100, 0, 0)])
     m = make_user(db, root, pkg, activate=False)
     db.commit()
-    assert client.post(f"/api/admin/approvals/{m.id}", json={"action": "reject"}).json()["message"].endswith("rejected")
-    assert client.post(f"/api/admin/approvals/{m.id}", json={"action": "approve"}).status_code == 404
-    assert level_commissions(db, root) == 0
+    assert client.post(f"/api/admin/approvals/{m.id}", json={"action": "reject"}).status_code == 400
+    assert m.status == "pending" and level_commissions(db, root) == 0
+    assert client.post(f"/api/admin/approvals/{m.id}", json={"action": "activate"}).json()["message"].endswith("active")
+    assert level_commissions(db, root) == 1
 
 
 def test_admin_registration_endpoint_activates_and_pays(client, db, root, pkg):

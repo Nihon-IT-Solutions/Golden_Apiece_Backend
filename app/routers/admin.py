@@ -7,12 +7,12 @@ from sqlalchemy.orm import Session
 
 from ..auth import hash_password, require_admin
 from ..database import get_db
-from ..models import (AppSetting, AutoPoolEntry, Commission, News, Package, Payout, PlanLevel, Reward, User,
+from ..models import (AppSetting, AutoPoolEntry, Commission, News, Package, Payout, Pin, PlanLevel, Reward, User,
                       WalletTransaction, now_utc)
 from ..schemas import ActionIn, AdminPasswordResetIn, FundIn, NewsIn, PackageIn, PlanLevelIn, ProfileIn, SettingsIn
 from ..services import (DEFAULT_SETTINGS, activate_member, add_txn, check_txn_password, enter_autopool, get_setting,
-                        money, month_series, package_breakup, package_out, plan_levels, setting_int, user_brief,
-                        user_detail, wallet_balance)
+                        level_plan_budget_warning, money, month_series, package_breakup, package_out, pin_out,
+                        plan_levels, setting_int, user_brief, user_detail, wallet_balance)
 from .member import autopool_entry_out, payout_summary, reward_out, txn_out
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -165,7 +165,9 @@ def member_password(user_id: int, body: AdminPasswordResetIn, db: Session = Depe
     return {"message": "Password updated"}
 
 
-# ---------------------------------------------------------------- approvals
+# ---------------------------------------------------------------- pending activations
+# Members join without approval; these list the ones whose package is not paid yet so the admin can
+# activate them once payment is received outside the system.
 @router.get("/approvals")
 def approvals(db: Session = Depends(get_db)):
     rows = db.scalars(select(User).where(User.status == "pending").order_by(User.joined_at.desc())).all()
@@ -175,15 +177,12 @@ def approvals(db: Session = Depends(get_db)):
 
 @router.post("/approvals/{user_id}")
 def approve(user_id: int, body: ActionIn, db: Session = Depends(get_db)):
+    if body.action not in ("activate", "approve"):  # 'approve' kept for older admin panels
+        raise HTTPException(400, "Unknown action")
     u = db.get(User, user_id)
     if not u or u.status != "pending":
-        raise HTTPException(404, "Pending registration not found")
-    if body.action == "approve":
-        activate_member(db, u)
-    elif body.action == "reject":
-        u.status = "rejected"
-    else:
-        raise HTTPException(400, "Unknown action")
+        raise HTTPException(404, "Pending member not found")
+    activate_member(db, u)
     db.commit()
     return {"message": f"{u.username} {u.status}"}
 
@@ -287,6 +286,23 @@ def package_delete(pid: int, db: Session = Depends(get_db)):
     db.delete(p)
     db.commit()
     return {"message": "Package deleted"}
+
+
+# ---------------------------------------------------------------- joining pins
+@router.get("/pins")
+def pins(status: str = "", q: str = "", db: Session = Depends(get_db)):
+    stmt = select(Pin).order_by(Pin.id.desc())
+    if status:
+        stmt = stmt.where(Pin.status == status)
+    if q:
+        owners = select(User.id).where(User.username.ilike(f"%{q.strip()}%"))
+        stmt = stmt.where(Pin.code.ilike(f"%{q.strip()}%") | Pin.owner_id.in_(owners))
+    rows = db.scalars(stmt.limit(1000)).all()
+    totals = dict(db.execute(select(Pin.status, func.count(Pin.id)).group_by(Pin.status)).all())
+    sold = db.execute(select(func.coalesce(func.sum(Pin.price), 0), func.coalesce(func.sum(Pin.commission), 0))).one()
+    return {"summary": {"unused": totals.get("unused", 0), "used": totals.get("used", 0), "amount": money(sold[0]),
+                        "commission": money(sold[1]), "net": money(sold[0] - sold[1])},
+            "items": [pin_out(p) for p in rows]}
 
 
 # ---------------------------------------------------------------- business
@@ -417,7 +433,8 @@ def plan_out(db: Session, plan: str) -> list[dict]:
 @router.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
     return {"values": {k: get_setting(db, k) for k in DEFAULT_SETTINGS},
-            "level_plan": plan_out(db, "level"), "autopool_plan": plan_out(db, "autopool")}
+            "level_plan": plan_out(db, "level"), "autopool_plan": plan_out(db, "autopool"),
+            "level_plan_warning": level_plan_budget_warning(db)}
 
 
 @router.put("/settings")
@@ -450,7 +467,7 @@ def put_plan(plan: str, body: list[PlanLevelIn], db: Session = Depends(get_db)):
         db.add(PlanLevel(plan=plan, level=i, amount=lv.amount, reward_amount=lv.reward_amount,
                          autopool_amount=lv.autopool_amount if plan == "level" else 0, reward_name=lv.reward_name))
     db.commit()
-    return {"message": "Compensation plan saved"}
+    return {"message": "Compensation plan saved", "warning": level_plan_budget_warning(db)}
 
 
 # ---------------------------------------------------------------- auto pool & rewards

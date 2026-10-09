@@ -1,4 +1,5 @@
 """Business logic shared by the admin and member APIs."""
+import secrets
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -7,7 +8,8 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from .auth import hash_password, verify_password
-from .models import AppSetting, AutoPoolEntry, Commission, Package, PlanLevel, Reward, User, WalletTransaction, now_utc
+from .models import (AppSetting, AutoPoolEntry, Commission, Mail, Package, Pin, PlanLevel, Reward, User,
+                     WalletTransaction, now_utc)
 
 
 def money(v) -> float:
@@ -226,18 +228,20 @@ def _accrue(r: Reward | None, total: Decimal, k: int, capacity: int, limit: Deci
 
 
 def pay_head(db: Session, earner: User, from_user: User, plan: str, level: int, cfg: PlanLevel, capacity: int,
-             entry: AutoPoolEntry | None = None):
+             entry: AutoPoolEntry | None = None, k: int | None = None):
     """Pay `earner` the per-head income for one new member at `level` of `plan` ('level' or 'autopool').
 
     Heads beyond the level capacity (width ** level) are not paid. The reward (and, for the level plan,
     the auto pool entry fund) is held back proportionally from every head, so when the level is complete
     the member has received exactly: total commission - reward - auto pool = net commission (plan sheet).
     Every head satisfies net + held == per-head amount, so no money is created or lost.
+    `k` is the head's number at the level; by default the number of heads already paid there + 1.
     """
-    stmt = select(func.count(Commission.id)).where(Commission.user_id == earner.id, Commission.commission_type == plan,
-                                                   Commission.level == level)
-    stmt = stmt.where(Commission.entry_id == entry.id) if entry else stmt.where(Commission.entry_id.is_(None))
-    k = (db.scalar(stmt) or 0) + 1
+    if k is None:
+        stmt = select(func.count(Commission.id)).where(Commission.user_id == earner.id,
+                                                       Commission.commission_type == plan, Commission.level == level)
+        stmt = stmt.where(Commission.entry_id == entry.id) if entry else stmt.where(Commission.entry_id.is_(None))
+        k = (db.scalar(stmt) or 0) + 1
     if k > capacity:
         return
     per_head = max(to_dec(cfg.amount), Decimal("0"))
@@ -280,10 +284,33 @@ def enter_autopool(db: Session, user: User, source: str = "") -> AutoPoolEntry:
     anc, level = parent, 1
     while anc is not None and level <= max(levels, default=0):
         cfg = levels.get(level)
-        if cfg and anc.user.status == "active":
-            pay_head(db, anc.user, user, "autopool", level, cfg, width ** level, anc)
+        if cfg:
+            # The positions under an entry are contiguous per depth, so the head number comes from the position.
+            # A head that arrives while the member is inactive is not paid but still counts, so the level (and
+            # its reward) still completes when the last position under the entry fills.
+            k = n - autopool_first_position(anc.position, width, level) + 1
+            if anc.user.status == "active":
+                pay_head(db, anc.user, user, "autopool", level, cfg, width ** level, anc, k)
+            elif k == width ** level:
+                close_reward(db, anc.user, level, anc)
         anc, level = anc.parent, level + 1
     return entry
+
+
+def autopool_first_position(position: int, width: int, depth: int) -> int:
+    """First position `depth` levels below `position`."""
+    for _ in range(depth):
+        position = position * width + 1
+    return position
+
+
+def close_reward(db: Session, earner: User, level: int, entry: AutoPoolEntry):
+    """Mark an auto pool reward achieved when its level filled while the member was inactive."""
+    r = db.scalar(select(Reward).where(Reward.user_id == earner.id, Reward.plan == "autopool", Reward.level == level,
+                                       Reward.kind == "reward", Reward.entry_id == entry.id))
+    if r is not None and r.status == "accruing":
+        r.status = "achieved"
+        r.achieved_at = now_utc()
 
 
 def autopool_level_counts(position: int, total: int, width: int, depth: int) -> list[int]:
@@ -353,8 +380,10 @@ def package_out(p: Package) -> dict:
 
 
 def register_member(db: Session, data: dict, registrar: User | None, payment: str = "pending") -> User:
-    """payment: 'admin' (activate), 'ewallet' (registrar pays, activate), 'pending' (wait for approval)."""
-    if payment not in ("admin", "ewallet", "pending"):
+    """payment: 'admin' (activate), 'ewallet' (registrar pays, activate), 'pin' (registrar spends one of its pins,
+    activate) or 'pending' (member can log in, activated once the package is paid). Admins are mailed about every
+    member that did not come from the admin panel."""
+    if payment not in ("admin", "ewallet", "pin", "pending"):
         raise HTTPException(400, "Unknown payment type")
     if payment != "pending":
         engine_lock(db)  # wallet check + activation must not interleave with another registration
@@ -363,8 +392,14 @@ def register_member(db: Session, data: dict, registrar: User | None, payment: st
         raise HTTPException(400, "Sponsor username not found")
     if sponsor.status != "active":
         raise HTTPException(400, "Sponsor account is not active")
+    pin = None
+    if payment == "pin":
+        if not registrar:
+            raise HTTPException(400, "Pin registration needs a logged-in member")
+        pin = find_unused_pin(db, registrar, data.get("pin_code"))
+        data["package_id"] = pin.package_id  # the pin decides the package
     pkg = db.get(Package, int(data["package_id"]))
-    if not pkg or not pkg.is_active:
+    if not pkg or (not pkg.is_active and pin is None):  # a pin bought earlier stays valid if the package is retired
         raise HTTPException(400, "Please choose a valid package")
     username = (data.get("username") or "").strip().upper() or next_username(db)
     if db.scalar(select(User.id).where(func.upper(User.username) == username)):
@@ -395,11 +430,138 @@ def register_member(db: Session, data: dict, registrar: User | None, payment: st
     db.refresh(u)
     if payment == "ewallet":
         add_txn(db, registrar.id, "debit", "registration", pkg.price, f"Registration of {u.username} ({pkg.name})", u.id)
-    if payment in ("admin", "ewallet"):
+    if pin is not None:
+        pin.status, pin.used_for_id, pin.used_at = "used", u.id, now_utc()
+        db.flush()  # the session does not autoflush; later pin queries in this transaction must see it used
+    if payment in ("admin", "ewallet", "pin"):
         activate_member(db, u)
     if payment == "ewallet":
         pay_franchise_commission(db, registrar, u, pkg)
+    if registrar is None or registrar.role != "admin":
+        notify_new_member(db, u, registrar)
     return u
+
+
+def find_unused_pin(db: Session, owner: User, code: str | None) -> Pin:
+    code = (code or "").strip().upper()
+    pin = db.scalar(select(Pin).where(func.upper(Pin.code) == code)) if code else None
+    if not pin or pin.owner_id != owner.id:
+        raise HTTPException(400, "Pin not found in your account")
+    if pin.status != "unused":
+        raise HTTPException(400, "This pin has already been used")
+    return pin
+
+
+def notify_new_member(db: Session, u: User, registrar: User | None):
+    """Drop a 'new member joined' mail into every admin's inbox."""
+    by = f" by {registrar.username}" if registrar else " (self sign-up)"
+    state = "Active" if u.status == "active" else "Pending activation (package not paid yet)"
+    body = (f"New member {u.username} ({u.full_name}) joined{by}.\n"
+            f"Sponsor: {u.sponsor.username if u.sponsor else '-'}\n"
+            f"Package: {u.package.name if u.package else '-'}\n"
+            f"Status: {state}")
+    for admin_id in db.scalars(select(User.id).where(User.role == "admin")).all():
+        db.add(Mail(sender_id=u.id, recipient_id=admin_id, subject=f"New member {u.username} joined", body=body))
+
+
+def activate_with_payment(db: Session, u: User, method: str, pin_code: str = "", txn_password: str = ""):
+    """A pending member pays for their own package with one of their pins or their e-wallet, then is activated."""
+    engine_lock(db)  # wallet check + activation must not interleave with another registration
+    if u.status != "pending":
+        raise HTTPException(400, "Your account is already active" if u.status == "active" else "Account not available")
+    if method == "pin":
+        pin = find_unused_pin(db, u, pin_code)
+        u.package_id = pin.package_id  # the pin decides the package
+        pin.status, pin.used_for_id, pin.used_at = "used", u.id, now_utc()
+    elif method == "ewallet":
+        check_txn_password(u, txn_password)
+        pkg = u.package
+        if not pkg or not pkg.is_active:
+            raise HTTPException(400, "Your package is no longer available, please activate with a pin")
+        if to_dec(wallet_balance(db, u.id)) < to_dec(pkg.price):
+            raise HTTPException(400, "Insufficient e-wallet balance for this package")
+        add_txn(db, u.id, "debit", "registration", pkg.price, f"Activation of {u.username} ({pkg.name})", u.id)
+    else:
+        raise HTTPException(400, "Unknown payment type")
+    db.flush()
+    activate_member(db, u)
+
+
+# ---------------------------------------------------------------- joining pins
+MAX_PINS_PER_ORDER = 500
+
+
+def new_pin_code(db: Session, pkg: Package) -> str:
+    while True:
+        code = f"{pkg.code}-{secrets.token_hex(4).upper()}"
+        if not db.scalar(select(Pin.id).where(Pin.code == code)):
+            return code
+
+
+def buy_pins(db: Session, franchise: User, pkg: Package | None, quantity: int) -> list[Pin]:
+    """Franchise buys `quantity` pins from its e-wallet: it pays price x qty and its franchise commission x qty is
+    credited straight back, so the net cost is (price - franchise commission) x qty (franchise pin sheet)."""
+    engine_lock(db)  # wallet check + debit must not interleave with another spend from the same wallet
+    if franchise.role != "user" or not franchise.is_franchise or franchise.status != "active":
+        raise HTTPException(403, "Only active franchise members can buy pins")
+    if not pkg or not pkg.is_active:
+        raise HTTPException(400, "Please choose a valid package")
+    if not 1 <= quantity <= MAX_PINS_PER_ORDER:
+        raise HTTPException(400, f"Quantity must be between 1 and {MAX_PINS_PER_ORDER}")
+    price, commission = to_dec(pkg.price), max(to_dec(pkg.franchise_commission or 0), Decimal("0"))
+    total, total_commission = price * quantity, commission * quantity
+    if to_dec(wallet_balance(db, franchise.id)) < total - total_commission:
+        raise HTTPException(400, "Insufficient e-wallet balance for these pins")
+    pins = [Pin(code=new_pin_code(db, pkg), package_id=pkg.id, owner_id=franchise.id, purchased_by_id=franchise.id,
+                price=price, commission=commission) for _ in range(quantity)]
+    db.add_all(pins)
+    add_txn(db, franchise.id, "debit", "pin_purchase", total, f"{quantity} x {pkg.name} pins")
+    if total_commission > 0:
+        db.add(Commission(user_id=franchise.id, from_user_id=franchise.id, commission_type="franchise", level=0,
+                          amount=total_commission))
+        add_txn(db, franchise.id, "credit", "commission", total_commission,
+                f"Franchise commission on {quantity} x {pkg.name} pins", franchise.id)
+    db.flush()
+    return pins
+
+
+def transfer_pins(db: Session, owner: User, to: User | None, pkg: Package | None, quantity: int) -> list[Pin]:
+    """Move `quantity` unused pins of `pkg` from `owner` to another member, oldest pins first."""
+    engine_lock(db)  # a pin must not be transferred and spent at the same time
+    if not to or to.id == owner.id or to.role != "user":
+        raise HTTPException(400, "Enter a valid member username")
+    if not pkg:
+        raise HTTPException(400, "Please choose a valid package")
+    if quantity < 1:
+        raise HTTPException(400, "Quantity must be at least 1")
+    pins = db.scalars(select(Pin).where(Pin.owner_id == owner.id, Pin.package_id == pkg.id, Pin.status == "unused")
+                      .order_by(Pin.id).limit(quantity)).all()
+    if len(pins) < quantity:
+        raise HTTPException(400, f"You have only {len(pins)} unused {pkg.name} pins")
+    for p in pins:
+        p.owner_id = to.id
+    db.flush()
+    return pins
+
+
+def pin_out(p: Pin) -> dict:
+    return {"id": p.id, "code": p.code, "package_id": p.package_id, "package": p.package.name, "price": money(p.price),
+            "commission": money(p.commission), "status": p.status, "owner": p.owner.username,
+            "purchased_by": p.purchased_by.username, "used_for": p.used_for.username if p.used_for else None,
+            "created_at": p.created_at.isoformat(), "used_at": p.used_at.isoformat() if p.used_at else None}
+
+
+# ---------------------------------------------------------------- plan budget check
+def level_plan_budget_warning(db: Session) -> str | None:
+    """Warn when the level plan pays more per new member (every level paid) than an active package budgets."""
+    per_member = sum((to_dec(lv.amount) for lv in plan_levels(db, "level").values()), Decimal("0"))
+    over = [p for p in db.scalars(select(Package).where(Package.is_active.is_(True)).order_by(Package.price))
+            if per_member > to_dec(p.commission_amount or 0)]
+    if not over:
+        return None
+    names = ", ".join(f"{p.name} ({money(p.commission_amount):g})" for p in over)
+    return (f"The level plan pays up to {money(per_member):g} per new member, more than the commission amount of: "
+            f"{names}")
 
 
 # ---------------------------------------------------------------- charts

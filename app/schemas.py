@@ -24,8 +24,9 @@ class RegisterIn(BaseModel):
     pincode: str = ""
     password: str
     txn_password: str | None = None
-    payment_method: str = "pending"  # ewallet | pending (members) ; admin registrations are always activated
+    payment_method: str = "pending"  # ewallet | pin | pending (members) ; admin registrations are always activated
     txn_password_confirm: str | None = None
+    pin_code: str | None = None  # with payment_method "pin"; the pin decides the package
 
 
 class ProfileIn(BaseModel):
@@ -68,6 +69,25 @@ class PayoutRequestIn(BaseModel):
     amount: float = Field(gt=0)
     txn_password: str
     method: str = "Bank Transfer"
+
+
+class ActivateIn(BaseModel):
+    payment_method: str  # pin | ewallet
+    pin_code: str = ""
+    txn_password: str = ""
+
+
+class PinBuyIn(BaseModel):
+    package_id: int
+    quantity: int = Field(ge=1)
+    txn_password: str
+
+
+class PinTransferIn(BaseModel):
+    to_username: str
+    package_id: int
+    quantity: int = Field(ge=1)
+    txn_password: str
 
 
 class FundIn(BaseModel):
